@@ -1,10 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"sync"
@@ -125,20 +125,31 @@ func ExtractFlowKey(pkt gopacket.Packet) FlowKey {
 }
 
 type RTTSample struct {
+	Flow *Flow
+	Dir  *FlowDir
 	Time time.Time
 	RTT  time.Duration
+	VEC  int
 }
 
 func (s RTTSample) MarshalJSON() ([]byte, error) {
 	out := make(map[string]interface{})
 
-	out["time"] = s.Time.UnixNano()
+	out["t"] = s.Time.UnixNano()
+	out["key"] = s.Flow.Key.String()
+	out["dir"] = s.Dir.Index
 	out["rtt"] = s.RTT.Nanoseconds()
+	out["pkt"] = s.Dir.PktCount
+	out["oct"] = s.Dir.OctCount
+	out["vec"] = s.VEC
 
 	return json.Marshal(out)
 }
 
 type FlowDir struct {
+	// Index of this flow direction
+	Index int
+
 	// Count of packets observed in this direction
 	PktCount uint64
 
@@ -165,25 +176,22 @@ type Flow struct {
 
 	// Counters and per-direction state
 	Dir [2]*FlowDir
-
-	// RTT series
-	RTTSamples []RTTSample
 }
 
-func (f *Flow) MarshalJSON() ([]byte, error) {
-	out := make(map[string]interface{})
+// func (f *Flow) MarshalJSON() ([]byte, error) {
+// 	out := make(map[string]interface{})
 
-	out["key"] = f.Key.String()
-	out["startTime"] = f.StartTime.UnixNano()
-	out["endTime"] = f.LastTime.UnixNano()
-	out["fwdPackets"] = f.Dir[0].PktCount
-	out["fwdOctets"] = f.Dir[0].OctCount
-	out["revPackets"] = f.Dir[1].PktCount
-	out["revOctets"] = f.Dir[1].OctCount
-	out["rtt"] = f.RTTSamples
+// 	out["key"] = f.Key.String()
+// 	out["startTime"] = f.StartTime.UnixNano()
+// 	out["endTime"] = f.LastTime.UnixNano()
+// 	out["fwdPackets"] = f.Dir[0].PktCount
+// 	out["fwdOctets"] = f.Dir[0].OctCount
+// 	out["revPackets"] = f.Dir[1].PktCount
+// 	out["revOctets"] = f.Dir[1].OctCount
+// 	out["rtt"] = f.RTTSamples
 
-	return json.Marshal(out)
-}
+// 	return json.Marshal(out)
+// }
 
 type FlowTable struct {
 	// The set of currently active flows
@@ -198,6 +206,9 @@ type FlowTable struct {
 	// The current time as of the last packet added to the flow
 	packetClock time.Time
 
+	// Stream to emit samples to
+	out io.Writer
+
 	Statistics struct {
 		ZeroKeyPackets int
 		NonQUICPackets int
@@ -205,26 +216,27 @@ type FlowTable struct {
 	}
 }
 
-func (ft *FlowTable) MarshalJSON() ([]byte, error) {
-	flows := make([]*Flow, len(ft.active))
+// func (ft *FlowTable) MarshalJSON() ([]byte, error) {
+// 	flows := make([]*Flow, len(ft.active))
 
-	i := 0
-	for _, f := range ft.active {
-		flows[i] = f
-		i++
-	}
+// 	i := 0
+// 	for _, f := range ft.active {
+// 		flows[i] = f
+// 		i++
+// 	}
 
-	out := make(map[string]interface{})
-	out["statistics"] = ft.Statistics
-	out["flows"] = flows
+// 	out := make(map[string]interface{})
+// 	out["statistics"] = ft.Statistics
+// 	out["flows"] = flows
 
-	return json.Marshal(out)
-}
+// 	return json.Marshal(out)
+// }
 
-func NewFlowTable(quicPort uint16) *FlowTable {
+func NewFlowTable(quicPort uint16, out io.Writer) *FlowTable {
 	ft := new(FlowTable)
 	ft.active = make(map[FlowKey]*Flow)
 	ft.quicPort = quicPort
+	ft.out = out
 	return ft
 }
 
@@ -258,7 +270,9 @@ func (ft *FlowTable) flowForKey(key FlowKey) (*Flow, bool, bool) {
 	// No entry available. Create a new one.
 	fe = new(Flow)
 	fe.Dir[0] = new(FlowDir)
+	fe.Dir[0].Index = 0
 	fe.Dir[1] = new(FlowDir)
+	fe.Dir[1].Index = 1
 
 	fe.Key = key
 
@@ -325,20 +339,18 @@ func (ft *FlowTable) HandlePacket(pkt gopacket.Packet) {
 	dir.PktCount += 1
 	dir.OctCount += uint64(length)
 
-	// extract spin from QUIC
-	spin, ok := extractSpin(pkt)
+	// extract spin and VEC from QUIC header
+	spin, vec, ok := extractSpinVEC(pkt)
 	if ok {
 		// is this an edge?
 		if dir.Spin != spin {
-			// yep, trigger edge
+
+			// yep, emit a sample (together with VEC, for post-procesing)
 			thisRTT := ft.packetClock.Sub(dir.EdgeTime)
 			dir.Spin = spin
 			dir.EdgeTime = ft.packetClock
 
-			// hack, reject all RTT samples > 1s to drop first edges
-			if thisRTT < 1*time.Second {
-				f.RTTSamples = append(f.RTTSamples, RTTSample{ft.packetClock, thisRTT})
-			}
+			ft.EmitSample(RTTSample{f, dir, ft.packetClock, thisRTT, vec})
 
 		}
 	}
@@ -346,19 +358,35 @@ func (ft *FlowTable) HandlePacket(pkt gopacket.Packet) {
 	ft.Statistics.QUICPackets++
 }
 
-func extractSpin(pkt gopacket.Packet) (int, bool) {
+func (ft *FlowTable) EmitSample(s RTTSample) {
+
+	b, err := json.Marshal(s)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = ft.out.Write(b)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func extractSpinVEC(pkt gopacket.Packet) (int, int, bool) {
 	if layer := pkt.Layer(layers.LayerTypeUDP); layer != nil {
 		udp := layer.(*layers.UDP)
 		b0 := udp.Payload[0]
 
 		if b0&0x80 == 0 {
-			// this is a short header, extract spin
-			return int(b0&0x10) >> 4, true
+			// this is a short header, extract spin and VEC
+			spin := int(b0&0x10) >> 4
+			vec := int(b0&0x0c) >> 2
+			return spin, vec, true
+
 		} else {
-			return 0, false
+			return 0, 0, false
 		}
 	} else {
-		return 0, false
+		return 0, 0, false
 	}
 }
 
@@ -370,7 +398,7 @@ func main() {
 	flag.Parse()
 
 	// create flow table
-	ft := NewFlowTable(uint16(*quicportflag))
+	ft := NewFlowTable(uint16(*quicportflag), os.Stdout)
 
 	// open pcap file
 	handle, err := pcap.OpenOffline(*fileflag)
@@ -386,13 +414,4 @@ func main() {
 		ft.HandlePacket(pkt)
 	}
 
-	// dump the flow table as JSON
-	b, err := json.Marshal(ft)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	f := bufio.NewWriter(os.Stdout)
-	defer f.Flush()
-	f.Write(b)
 }
