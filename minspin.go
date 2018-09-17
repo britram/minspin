@@ -414,4 +414,5 @@ func main() {
 		ft.HandlePacket(pkt)
 	}
 
+	log.Printf("done; statistics: %+v", ft.Statistics)
 }
