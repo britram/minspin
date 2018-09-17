@@ -26,7 +26,7 @@ type FlowKey struct {
 
 // Return a string representation of this FlowKey suitable for printing
 func (key FlowKey) String() string {
-	return fmt.Sprintf("%s:%d -> %s:%d %d", key.Sip, key.Sp, key.Dip, key.Dp, key.P)
+	return fmt.Sprintf("%s:%d|%s:%d|%d", key.Sip, key.Sp, key.Dip, key.Dp, key.P)
 }
 
 // Reverse returns the reverse of this FlowKey,
@@ -365,7 +365,7 @@ func (ft *FlowTable) EmitSample(s RTTSample) {
 		log.Fatal(err)
 	}
 
-	_, err = ft.out.Write(b)
+	_, err = fmt.Fprintf(ft.out, "%s\n", string(b))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -378,8 +378,8 @@ func extractSpinVEC(pkt gopacket.Packet) (int, int, bool) {
 
 		if b0&0x80 == 0 {
 			// this is a short header, extract spin and VEC
-			spin := int(b0&0x10) >> 4
-			vec := int(b0&0x0c) >> 2
+			spin := int(b0&0x04) >> 2
+			vec := int(b0 & 0x03)
 			return spin, vec, true
 
 		} else {
